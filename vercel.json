@@ -1,0 +1,20 @@
+{
+  "version": 2,
+  "ignoreCommand": "if [ -n \"$VERCEL_GIT_PREVIOUS_SHA\" ] && git diff --quiet \"$VERCEL_GIT_PREVIOUS_SHA\" HEAD -- . ; then echo 'No change in this folder since the last deployment: skipping the build.'; exit 0; else exit 1; fi",
+  "builds": [
+    {
+      "src": "src/server.ts",
+      "use": "@vercel/node"
+    }
+  ],
+  "routes": [
+    {
+      "src": "^/$",
+      "dest": "src/server.ts"
+    },
+    {
+      "src": "^/api/(.*)$",
+      "dest": "src/server.ts"
+    }
+  ]
+}

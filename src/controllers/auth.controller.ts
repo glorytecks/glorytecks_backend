@@ -1,0 +1,158 @@
+import { Request, Response } from 'express';
+import { authService } from '../services/auth.service';
+import { asyncHandler } from '../utils/asyncHandler';
+import { sendSuccess } from '../utils/ApiResponse';
+import { env } from '../config/env';
+import { COOKIE_NAMES } from '../constants';
+import { ApiError } from '../utils/ApiError';
+import { noteLoginFailure, noteLoginSuccess } from '../middlewares/rateLimit';
+
+// 7 days in ms (aligns with default refresh expiry; cookie maxAge is best-effort).
+const REFRESH_COOKIE_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
+
+function setRefreshCookie(res: Response, token: string): void {
+  res.cookie(COOKIE_NAMES.REFRESH, token, {
+    httpOnly: true,
+    secure: env.cookie.secure,
+    sameSite: env.cookie.sameSite,
+    maxAge: REFRESH_COOKIE_MAX_AGE,
+    path: '/',
+  });
+}
+
+function clearRefreshCookie(res: Response): void {
+  res.clearCookie(COOKIE_NAMES.REFRESH, {
+    httpOnly: true,
+    secure: env.cookie.secure,
+    sameSite: env.cookie.sameSite,
+    path: '/',
+  });
+}
+
+export const authController = {
+  login: asyncHandler(async (req: Request, res: Response) => {
+    const { email, password } = req.body as { email: string; password: string };
+
+    let result;
+    try {
+      result = await authService.login(email, password);
+    } catch (err) {
+      // Feeds the progressive delay. Recorded against the SUBMITTED address
+      // whether or not it belongs to an account, so the backoff an attacker
+      // experiences is identical either way and cannot be used to test which
+      // addresses are registered.
+      await noteLoginFailure(email, req);
+      throw err;
+    }
+
+    // A correct password ends the streak: someone who mistyped twice and then
+    // got it right should not carry a delay into their next session.
+    await noteLoginSuccess(email, req);
+
+    setRefreshCookie(res, result.tokens.refreshToken);
+    return sendSuccess(
+      res,
+      { user: result.user, accessToken: result.tokens.accessToken },
+      'Logged in successfully',
+    );
+  }),
+
+  refresh: asyncHandler(async (req: Request, res: Response) => {
+    // Accept refresh token from cookie (preferred) or body (fallback for mobile clients).
+    const token: string | undefined =
+      req.cookies?.[COOKIE_NAMES.REFRESH] ?? (req.body as { refreshToken?: string }).refreshToken;
+    if (!token) throw ApiError.unauthorized('No refresh token');
+    const { user, tokens } = await authService.refresh(token);
+    setRefreshCookie(res, tokens.refreshToken);
+    return sendSuccess(res, { user, accessToken: tokens.accessToken }, 'Token refreshed');
+  }),
+
+  /* ── Email code, Google, password reset ── */
+
+  requestLoginCode: asyncHandler(async (req: Request, res: Response) => {
+    await authService.requestLoginCode((req.body as { email: string }).email);
+    return sendSuccess(res, null, 'If that email belongs to an admin, a sign-in code is on its way.');
+  }),
+
+  verifyLoginCode: asyncHandler(async (req: Request, res: Response) => {
+    const { email, code } = req.body as { email: string; code: string };
+    let result;
+    try {
+      result = await authService.verifyLoginCode(email, code);
+    } catch (err) {
+      await noteLoginFailure(email, req);
+      throw err;
+    }
+    await noteLoginSuccess(email, req);
+    setRefreshCookie(res, result.tokens.refreshToken);
+    return sendSuccess(res, { user: result.user, accessToken: result.tokens.accessToken }, 'Logged in successfully');
+  }),
+
+  googleUrl: asyncHandler(async (_req: Request, res: Response) => {
+    return sendSuccess(res, { url: await authService.googleSignInUrl() }, 'Google sign-in');
+  }),
+
+  exchangeSession: asyncHandler(async (req: Request, res: Response) => {
+    const { accessToken, refreshToken } = req.body as { accessToken: string; refreshToken: string };
+    const result = await authService.exchangeSession(accessToken, refreshToken);
+    setRefreshCookie(res, result.tokens.refreshToken);
+    return sendSuccess(res, { user: result.user, accessToken: result.tokens.accessToken }, 'Logged in successfully');
+  }),
+
+  forgotPassword: asyncHandler(async (req: Request, res: Response) => {
+    await authService.requestPasswordReset((req.body as { email: string }).email);
+    return sendSuccess(res, null, 'If that email belongs to an admin, a reset email is on its way.');
+  }),
+
+  resetPassword: asyncHandler(async (req: Request, res: Response) => {
+    const { accessToken, email, code, newPassword } = req.body as {
+      accessToken?: string;
+      email?: string;
+      code?: string;
+      newPassword: string;
+    };
+    try {
+      await authService.resetPassword({ accessToken, email, code }, newPassword);
+    } catch (err) {
+      if (email) await noteLoginFailure(email, req);
+      throw err;
+    }
+    clearRefreshCookie(res);
+    return sendSuccess(res, null, 'Password updated. Sign in with your new password.');
+  }),
+
+  logout: asyncHandler(async (req: Request, res: Response) => {
+    // Revokes the Supabase session behind this access token; previously this
+    // cleared the stored refresh-token hash. Same effect, same response.
+    if (req.user) await authService.logout(req.accessToken);
+    clearRefreshCookie(res);
+    return sendSuccess(res, null, 'Logged out');
+  }),
+
+  me: asyncHandler(async (req: Request, res: Response) => {
+    const user = await authService.getProfile(req.user!.id);
+    return sendSuccess(res, user, 'Profile fetched');
+  }),
+
+  updateProfile: asyncHandler(async (req: Request, res: Response) => {
+    const { name, avatar } = req.body as { name?: string; avatar?: string };
+    const user = await authService.updateProfile(req.user!.id, { name, avatar });
+    return sendSuccess(res, user, 'Profile updated');
+  }),
+
+  changePassword: asyncHandler(async (req: Request, res: Response) => {
+    const { currentPassword, newPassword } = req.body as {
+      currentPassword: string;
+      newPassword: string;
+    };
+    await authService.changePassword(
+      req.user!.id,
+      currentPassword,
+      newPassword,
+      req.accessToken,
+    );
+    clearRefreshCookie(res);
+    return sendSuccess(res, null, 'Password changed, please log in again');
+  }),
+};
+

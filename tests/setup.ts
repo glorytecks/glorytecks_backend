@@ -1,0 +1,86 @@
+/**
+ * Test environment bootstrap.
+ *
+ * Imported as the FIRST import of any test that loads application modules.
+ * Module requires are hoisted above ordinary statements, so setting these
+ * variables inline in a test file would run too late — the Supabase client is
+ * constructed at import time and would fail on a missing key.
+ *
+ * These are placeholders. No test makes a real network call: the repository
+ * tests swap the client's `from()` for a recorder.
+ */
+process.env.NODE_ENV = process.env.NODE_ENV ?? 'test';
+process.env.SUPABASE_URL = process.env.SUPABASE_URL ?? 'http://127.0.0.1:54321';
+process.env.SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY ?? 'test-anon-key';
+process.env.SUPABASE_SERVICE_ROLE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY ?? 'test-service-role-key';
+process.env.COOKIE_SECRET = process.env.COOKIE_SECRET ?? 'test-cookie-secret';
+process.env.CACHE_ENABLED = 'false';
+
+// A developer's local `.env` is loaded by config/env before the tests run. Blank
+// the storage credentials so no test can reach the real Cloudinary account: the
+// upload service then short-circuits to 503, which is the deterministic
+// "everything upstream of storage passed" signal the route tests assert on.
+// (Set to '' rather than deleted — dotenv only fills keys that are absent.)
+process.env.CLOUDINARY_CLOUD_NAME = '';
+process.env.CLOUDINARY_API_KEY = '';
+process.env.CLOUDINARY_API_SECRET = '';
+
+// Same for the site revalidation webhook: a developer's `.env` may point it at
+// a running site, and the route tests perform CMS writes. Tests that exercise
+// the webhook pass their own URL, secret and fetch.
+process.env.SITE_REVALIDATE_URL = '';
+process.env.SITE_REVALIDATE_SECRET = '';
+
+// Same for IndexNow: the route tests perform CMS writes, which must never
+// submit anything. Tests that exercise it pass their own key and fetch.
+process.env.INDEXNOW_KEY = '';
+
+// And for the technical SEO audit: a developer's `.env` may name the live site.
+// The audit tests set their own origin and answer every request from fixtures.
+process.env.SEO_AUDIT_ORIGIN = '';
+process.env.SEO_AUDIT_MAX_PAGES = '';
+process.env.SEO_AUDIT_STEP_MS = '';
+
+// And the Google integrations: a developer's `.env` may hold a real service
+// account. Tests that need one set a throwaway key generated at run time.
+process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL = '';
+process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = '';
+process.env.GSC_SITE_URL = '';
+process.env.GA4_PROPERTY_ID = '';
+
+// Pin a production-shaped CORS policy. Without these the defaults are
+// permissive (PUBLIC_CORS_ORIGINS falls back to '*'), so the rejection path
+// would never run under test and a regression in it would go unnoticed.
+process.env.CORS_ORIGINS = process.env.CORS_ORIGINS ?? 'https://admin.glorytecks.test';
+process.env.PUBLIC_CORS_ORIGINS = process.env.PUBLIC_CORS_ORIGINS ?? 'https://glorytecks.test';
+
+/**
+ * Fail Supabase calls immediately instead of waiting on a real connection.
+ *
+ * Many tests assert that a request PASSED validation by checking it got as far
+ * as the database and failed there. Left alone, each of those waits for
+ * supabase-js to attempt a connection and retry, which turned the suite into a
+ * multi-minute run for no added coverage.
+ *
+ * The rejection deliberately mimics the exact shape Node produces for a
+ * refused connection — a `TypeError: fetch failed` with the errno on `cause` —
+ * because that shape is itself under test: it is what `isConnectivityFailure`
+ * has to see through in order to answer 503 rather than 500.
+ */
+const realFetch = globalThis.fetch;
+globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+  const url = String(
+    typeof input === 'string' ? input : input instanceof URL ? input.href : (input as Request).url,
+  );
+  if (url.includes('127.0.0.1:54321')) {
+    return Promise.reject(
+      Object.assign(new TypeError('fetch failed'), {
+        cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:54321'), {
+          code: 'ECONNREFUSED',
+        }),
+      }),
+    );
+  }
+  return realFetch(input, init);
+}) as typeof fetch;
